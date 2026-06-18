@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "truenas-config-backup"
+version = "2.0.0"
+description = "Automated TrueNAS system-config backup via WebSocket JSON-RPC with daily/weekly/monthly retention"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    # truenas_api_client is NOT on PyPI; install from GitHub:
+    #   pip install git+https://github.com/truenas/api_client.git@<server-version-tag>
+    # verify_ssl support requires the 25.10 client line or newer.
+    # Example for TrueNAS SCALE 25.10:
+    #   pip install git+https://github.com/truenas/api_client.git@25.10.0
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+truenas-backup = "truenas_backup.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["truenas_backup*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+addopts = "--tb=short -q"

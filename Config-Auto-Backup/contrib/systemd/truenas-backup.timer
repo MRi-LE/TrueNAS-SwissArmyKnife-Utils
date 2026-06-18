@@ -1,0 +1,10 @@
+[Unit]
+Description=Run TrueNAS Config Backup daily at 02:00
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+# Run immediately if the last scheduled run was missed (e.g. after downtime)
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=TrueNAS Config Backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=truenas-backup
+Group=truenas-backup
+WorkingDirectory=/opt/truenas-config-backup
+ExecStart=/usr/bin/python3 /opt/truenas-config-backup/run_backup.py
+EnvironmentFile=/opt/truenas-config-backup/.env
+StandardOutput=journal
+StandardError=journal
+# Harden the service
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/mnt/backups/truenas-config
