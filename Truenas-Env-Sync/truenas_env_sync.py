@@ -26,7 +26,7 @@ Usage
     python3 truenas_env_sync.py --all       [--dry-run] [--no-backup]
     python3 truenas_env_sync.py <app_name> --clear-history KEY [KEY ...]
 
-Version: v0.4.2
+Version: v0.4.3
 
     app_name        : e.g. "homepage"
     --all           : sync every app found in APP_CONFIGS_ROOT
@@ -66,9 +66,11 @@ APP_CONFIGS_ROOT = Path("/mnt/.ix-apps/app_configs")
 # found in env_variables.
 IGNORED_KEYS = {"TZ"}
 
-# Counter used to make backup timestamps unique within a single run
-# (matters for --all + cron where multiple apps are written in the same second)
-_tmp_counter = 0
+# Per-run counters -- incremented for every temp file and backup created.
+# Keeps names unique within a single run regardless of wall-clock resolution,
+# which matters for --all + cron where many files are written per second.
+_tmp_counter    = 0
+_backup_counter = 0
 
 
 def _unique_tmp(path: Path) -> Path:
@@ -76,11 +78,6 @@ def _unique_tmp(path: Path) -> Path:
     global _tmp_counter
     _tmp_counter += 1
     return path.parent / f".{path.name}.{os.getpid()}.{_tmp_counter:04d}.tmp"
-
-
-# Counter used to make backup timestamps unique within a single run
-# (matters for --all + cron where multiple apps are written in the same second)
-_backup_counter = 0
 
 
 # --- Dry-run diff helpers ---
@@ -157,18 +154,18 @@ def _print_env_file_diff(
     new_history         : {key: yaml_value} -- new collision entries that would be added
     clear_history       : keys whose history is being wiped
     cleared_and_colliding : keys being cleared that also have a current collision
+
+    Note: active keys are never removed during a sync (env_variables only grows
+    or stays the same). The diff therefore has no removed-key branch.
     """
-    added_keys   = sorted(k for k in after_envs  if k not in before_envs)
-    removed_keys = sorted(k for k in before_envs if k not in after_envs)
-    unchanged    = sum(1 for k in after_envs if k in before_envs)
+    added_keys = sorted(k for k in after_envs if k not in before_envs)
+    unchanged  = sum(1 for k in after_envs if k in before_envs)
 
     print(f"\n[DRY-RUN] env_variables changes:")
     print(f"  File: {path}")
 
     for k in added_keys:
         print(f"  + {k}  (YAML-only key added back)")
-    for k in removed_keys:
-        print(f"  - {k}  (key removed)")
     for k in sorted(new_history):
         if k not in clear_history:
             print(f"  ~ {k}  (superseded history added)")
@@ -179,7 +176,7 @@ def _print_env_file_diff(
             print(f"  - {k}  (history cleared)")
     if unchanged:
         print(f"  = {unchanged} active key(s) unchanged")
-    if not (added_keys or removed_keys or new_history or clear_history):
+    if not (added_keys or new_history or clear_history):
         print("  (no env_variables changes)")
 
 
@@ -218,6 +215,12 @@ def validate_yaml(path: Path, expected_data: dict) -> bool:
     """
     Re-parse path and compare to expected_data.
     Returns True if they match, False (with warning) otherwise.
+
+    Assumes PyYAML round-trips the data identically (serialize -> parse -> same dict).
+    This holds for str-only env values but could produce false corruption warnings
+    for unusual scalar types (e.g. floats, booleans) if they ever appear in the
+    YAML outside of additional_envs. In practice this tool only writes str values,
+    so the assumption is stable.
     """
     try:
         on_disk = load_yaml(path)
@@ -694,6 +697,13 @@ def sync_app(
         if cleared_and_colliding:
             print(f"   Note: {sorted(cleared_and_colliding)} also collide this run"
                   f" -- current YAML value not re-added to history (clear wins)")
+        # Report per-key outcome so --all runs make it obvious which apps were affected.
+        had_history    = sorted(k for k in clear_history if superseded.get(k))
+        no_history     = sorted(k for k in clear_history if not superseded.get(k))
+        if had_history:
+            print(f"   [INFO]  History cleared for: {had_history}")
+        if no_history:
+            print(f"   [INFO]  No history to clear for: {no_history} (key(s) had none)")
         if new_from_yaml:
             print(f"   Also adding {len(new_from_yaml)} YAML-only key(s) back to file: {sorted(new_from_yaml)}")
         if dry_run:

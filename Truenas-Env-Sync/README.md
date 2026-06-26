@@ -29,7 +29,7 @@ Format -- one `KEY:VALUE` per line (values may contain colons, e.g. URLs):
 
 ```
 # Comments and blank lines are ignored
-HOMEPAGE_VAR_URL_GLANCE_TN-PROD:http://192.168.1.22:40087
+HOMEPAGE_VAR_URL_GLANCE_TN-PROD: YOUR-IP
 HOMEPAGE_VAR_ANOTHER_KEY:somevalue
 ```
 
@@ -186,6 +186,208 @@ pip install pyyaml --break-system-packages
 
 ---
 
+## Architecture & Design Decisions
+
+This section is the authoritative record of decisions made during development.
+It exists so that a complete project handoff can be generated from this file alone.
+
+### Runtime environment
+
+- TrueNAS Scale 25 (Ubuntu 24 base), Python 3.10+
+- Single external dependency: `pyyaml` (`pip install pyyaml --break-system-packages`)
+- Must run as root (`sudo`) to access `/mnt/.ix-apps/`
+- Source must be pure ASCII -- Forgejo strict unicode warning applies to `.py` files and README
+
+### File format: KEY:VALUE flat file
+
+One entry per line. Value is everything after the first colon, so URLs and other
+colon-containing values work correctly without quoting. Blank lines and `#` comment
+lines are ignored. `# [superseded]` comment lines are a structured extension of this
+format (see Collision tracking below) and are parsed by the script.
+
+### IGNORED_KEYS -- TZ is fully out of scope
+
+`TZ` (and any future entries in `IGNORED_KEYS`) is owned by TrueNAS. The script
+never reads, writes, or modifies it anywhere. This is a stronger contract than the
+original "special top-level key" framing, which still actively wrote `TZ` into both
+YAMLs. The current contract: if `TZ` appears in `env_variables`, warn and skip;
+leave its value in the YAML files exactly as TrueNAS set them.
+
+Only genuinely scalar env-like top-level keys belong in `IGNORED_KEYS`. Do not add
+structured config keys like `network` or `resources` -- those are not env vars and
+adding them would turn this tool into a partial TrueNAS config editor.
+
+### Merge strategy and source of truth
+
+`env_variables` wins on conflict. YAML-only keys (present in YAML but absent from
+the file) are added back to `env_variables` so the file stays complete. This means
+the file grows but never shrinks during a sync -- active keys are never deleted.
+
+### Global YAML is output-only
+
+The per-app YAML is the canonical source of env state. The global YAML is TrueNAS's
+denormalized mirror. The script reads `additional_envs` only from the per-app YAML,
+then writes the merged result to both files. The global YAML's existing
+`additional_envs` are not read as a second input source. If they contain keys not in
+the per-app YAML, a `[WARN]` is printed and those keys are removed. This is a
+deliberate design decision, not an oversight.
+
+### Collision tracking via superseded comments
+
+When `env_variables` wins a conflict against the YAML, the old YAML value is
+preserved as a structured comment on the line directly below:
+
+```
+MY_KEY:file-value
+# [superseded] MY_KEY:old-yaml-value
+```
+
+History accumulates across syncs. Duplicates are never added twice. History is never
+auto-deleted -- use `--clear-history KEY` to remove it explicitly.
+
+Collisions are captured from the pre-merge YAML state inside `update_app_yaml()` and
+threaded through to `write_env_file()`. This is important: by the time `main()` runs,
+the merged dict already has file values applied, so the original YAML value is gone.
+
+### Atomic writes and partial failure safety
+
+All file writes go through a uniquely-named sibling temp file
+(`.filename.PID.NNNN.tmp`) and `os.replace()` (POSIX atomic). A crash mid-write
+never leaves a partial file.
+
+Preflight: both YAMLs are parsed in memory before either is written. If either fails
+to parse, no files are touched. This prevents parse-related partial updates.
+
+Partial failure limit: if a runtime write error occurs after the app YAML is
+successfully written but before the global YAML is written, the two files are
+inconsistent. Restore from `.bak` files. Preflight does not protect against this.
+
+If app YAML post-write validation fails, the global YAML write is skipped entirely.
+
+### Post-write validation
+
+After each YAML write, the file is re-parsed and compared to the in-memory dict.
+Assumes PyYAML round-trips str-only values identically (serialize -> parse -> same
+dict). This holds for the string env values this tool writes. Non-string scalars
+outside `additional_envs` (e.g. booleans, floats) could theoretically produce false
+corruption warnings. Non-string values inside `additional_envs` are coerced to `str`
+before comparison, so they are safe.
+
+### Safe terminal output
+
+No raw values are ever printed. Keys whose names contain `password`, `pass`, `token`,
+`secret`, `key`, `api_key`, `auth`, or `credential` (case-insensitive substring
+match) are redacted as `<redacted>`. All other values are truncated at 80 characters.
+This applies to dry-run diffs, collision warnings, duplicate key warnings, malformed
+line warnings, and YAML coercion warnings. Malformed lines report only the line
+number, never the content.
+
+The match is intentionally aggressive (e.g. `NORMAL_KEY` is redacted). False
+positives are annoying; false negatives leak secrets to cron logs, systemd journals,
+and SSH session history.
+
+### Version detection
+
+The script picks the numerically highest directory under `versions/` and warns if
+multiple exist. It does not verify which version TrueNAS considers active. For clean
+numeric version folders (e.g. `1.3.3`) this is correct in practice. Non-numeric
+folder names fall back to sort key `(0,)`.
+
+`latest_version_dir()` raises `FileNotFoundError` (not `sys.exit()`) so `--all` can
+catch per-app errors and continue.
+
+### --all and --clear-history broadcast behaviour
+
+`--all` processes every app directory under `app_configs/` that does not start with
+`.`. Each app is wrapped in `try/except Exception` so any error is isolated to that
+app. Exit code is 1 if any app failed.
+
+`--clear-history KEY` combined with `--all` applies the same key set to every app.
+This is intentional but broad -- if a key name is common across apps, history is
+cleared everywhere in one shot. Each app prints `[INFO] History cleared for: [...]`
+and `[INFO] No history to clear for: [...] (key(s) had none)` so the per-app outcome
+is always visible.
+
+When a key is both being cleared and currently colliding, the current YAML value is
+not re-added as a superseded entry. "Clear means clear now." The collision is still
+resolved (file wins); it just produces no history line for that run.
+
+### Key function signatures (v0.4.3)
+
+```
+sync_app(app_name, dry_run, do_backup, clear_history=set()) -> bool
+
+update_app_yaml(app_yaml_path, app_name, file_envs, dry_run, do_backup,
+                preloaded_data=None)
+    -> tuple[dict, set, dict, bool]
+    -- (merged_additional, new_from_yaml, collisions, valid)
+
+update_global_yaml(global_path, app_name, merged_additional, dry_run, do_backup,
+                   preloaded_data=None)
+    -> bool  -- valid
+
+merge_envs(from_yaml, from_file)
+    -> tuple[dict, set, dict]
+    -- (merged, new_keys, collisions)
+
+parse_env_file(env_file)
+    -> tuple[dict, dict]
+    -- (envs, superseded)
+
+write_env_file(env_file, envs, superseded={}, collisions={},
+               clear_history=set(), dry_run=False)
+    -> None
+
+_display_value(key, value) -> str   # redacts secrets, truncates others
+```
+
+### YAML structure reference
+
+Per-app YAML (`/mnt/.ix-apps/app_configs/<app>/versions/<x.x.x>/user_config.yaml`):
+```yaml
+TZ: America/Los_Angeles       # IGNORED -- left exactly as TrueNAS set it
+homepage:
+  additional_envs:
+    - name: HOMEPAGE_VAR_URL_GLANCE_TN-PROD
+      value: http://192.168.178.105:30015
+```
+
+Global YAML (`/mnt/.ix-apps/user_config.yaml`) -- app block nested one level deeper:
+```yaml
+homepage:
+  TZ: America/Los_Angeles     # IGNORED -- left exactly as TrueNAS set it
+  homepage:
+    additional_envs:
+      - name: HOMEPAGE_VAR_URL_GLANCE_TN-PROD
+        value: http://192.168.178.105:30015
+```
+
+---
+
+## Open Questions
+
+These are unresolved questions about the environment or design. Answers may change
+decisions above or unlock new TODO items.
+
+1. **Version directory lifecycle** -- when TrueNAS updates an app and bumps the
+   version directory, does it clean up the old directory or do both coexist? If both
+   coexist, the script will always target the newer one (correct), but the warning
+   about multiple dirs will fire on every run (noisy). If TrueNAS cleans up, the
+   warning is rare and meaningful.
+
+2. **Other scalar top-level YAML keys** -- are there apps that use top-level keys
+   other than `TZ` that behave like env vars (i.e. scalar, user-settable, not
+   structural config)? If so, they belong in `IGNORED_KEYS`. Known non-candidates:
+   `network`, `resources` (structured config, not env vars).
+
+3. **Global YAML as input source** -- the current design treats the global YAML as
+   output-only. If TrueNAS ever writes keys to the global YAML that don't appear in
+   the per-app YAML (outside of `TZ`), those keys are silently removed on the next
+   sync. Is this the correct behaviour, or should the global YAML be read as a second
+   input source? Currently documented as deliberate; revisit if data loss is observed.
+
+---
+
 ## Changelog
 
 ### v0.1.0 -- Initial release
@@ -256,6 +458,13 @@ pip install pyyaml --break-system-packages
 
 - **Preflight comment corrected** -- the inline comment in `sync_app()` previously stated that preflight "prevents a partial write leaving the two files in a desync state," which overstated the guarantee. The comment now accurately reflects the README: preflight prevents parse-related partial updates (one file unreadable before any write begins); runtime write failures after the first file succeeds are not prevented and require restoring from `.bak` files.
 - **Early exit on app YAML validation failure** -- `sync_app()` now returns `False` immediately if `update_app_yaml()` reports `app_valid=False`, skipping the `update_global_yaml()` call entirely. Previously, the global YAML was still written even when the app YAML failed post-write validation, potentially deepening the desync. The error message now explicitly states that the global write was skipped.
+
+### v0.4.3 -- Review fixes
+
+- **Dead code removed:** `_print_env_file_diff()` previously computed and printed a `removed_keys` branch (`- KEY (key removed)`). Active keys are never deleted during a sync -- `env_variables` only grows or stays the same. The branch was always empty and its label was misleading. Removed; docstring updated to document this invariant explicitly.
+- **`--all --clear-history` silent broadcast fixed:** When `--clear-history KEY` is combined with `--all`, the same key set is applied to every app. Previously, each app printed only the keys being targeted, with no indication of whether those keys actually had history to clear. Now each app prints `[INFO] History cleared for: [...]` and `[INFO] No history to clear for: [...] (key(s) had none)` so batch runs make per-app outcomes visible without reading every line.
+- **Counter declarations consolidated:** `_tmp_counter` and `_backup_counter` were declared in two separate locations separated by unrelated code and a misleading duplicate comment. Both are now declared together in a single block with a shared explanatory comment.
+- **`validate_yaml()` fragility documented:** Added a docstring note that the post-write equality check assumes PyYAML round-trips data identically. This holds for the str-only env values this tool writes. Unusual scalar types outside `additional_envs` could theoretically produce false corruption warnings; the note makes the assumption explicit rather than implicit.
 
 ### v0.4.2 -- Safe dry-run output
 
